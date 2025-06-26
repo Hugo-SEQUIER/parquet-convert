@@ -43,7 +43,7 @@ app.add_middleware(
 AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 AWS_REGION = os.getenv('AWS_REGION', 'eu-west-1')
-SMART_JSON_BUCKET = os.getenv('SMART_JSON_BUCKET', 'irys-smart-json-output')  # Default bucket for smart JSON outputs
+SMART_JSON_BUCKET = os.getenv('S3_BUCKET', 'irys-smart-json-output')  # Default bucket for smart JSON outputs
 
 # S3 Client
 s3_client = boto3.client(
