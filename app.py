@@ -6,6 +6,9 @@ import boto3
 import pandas as pd
 import os
 import tempfile
+import json
+import uuid
+from datetime import datetime
 from dotenv import load_dotenv
 import uvicorn
 
@@ -40,6 +43,7 @@ app.add_middleware(
 AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 AWS_REGION = os.getenv('AWS_REGION', 'eu-west-1')
+SMART_JSON_BUCKET = os.getenv('SMART_JSON_BUCKET', 'irys-smart-json-output')  # Default bucket for smart JSON outputs
 
 # S3 Client
 s3_client = boto3.client(
@@ -67,6 +71,21 @@ def download_from_s3(bucket: str, key: str, local_path: str) -> bool:
         return True
     except Exception as e:
         print(f"Error during download: {e}")
+        return False
+
+def upload_json_to_s3(json_data: dict, bucket: str, key: str) -> bool:
+    """Upload JSON data to S3"""
+    try:
+        json_string = json.dumps(json_data, indent=2)
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json_string,
+            ContentType='application/json'
+        )
+        return True
+    except Exception as e:
+        print(f"Error during JSON upload: {e}")
         return False
 
 def read_file_to_dataframe(input_path: str) -> pd.DataFrame:
@@ -163,15 +182,27 @@ def generate_smart_json_endpoint(payload: S3PathsInput):
             print(f"🔄 Generating SmartJSON...")
             smart_json_result = generate_smart_json(combined_df, total_raw_size)
             
-            # 5. Return the result (without deleting S3 files)
+            # 5. Upload SmartJSON to S3
+            print(f"🔄 Uploading SmartJSON to S3...")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            unique_id = str(uuid.uuid4())[:8]
+            smart_json_key = f"smart-json/{timestamp}_{unique_id}.json"
+            
+            if not upload_json_to_s3(smart_json_result, SMART_JSON_BUCKET, smart_json_key):
+                raise HTTPException(status_code=500, detail="Failed to upload SmartJSON to S3")
+            
+            smart_json_s3_path = f"s3://{SMART_JSON_BUCKET}/{smart_json_key}"
+            print(f"✅ SmartJSON uploaded to: {smart_json_s3_path}")
+            
+            # 6. Return the S3 path instead of the full JSON
             response = {
-                "smartJson": smart_json_result,
+                "smartJsonS3Path": smart_json_s3_path,
                 "processedFiles": len(processed_files),
                 "totalFiles": len(s3_paths),
                 "combinedRows": len(combined_df),
                 "combinedColumns": len(combined_df.columns)
             }
-            print(f"✅ SmartJSON generated successfully for {len(processed_files)} files")
+            print(f"✅ SmartJSON generated and uploaded successfully for {len(processed_files)} files")
             return response
             
     except Exception as e:
@@ -193,9 +224,16 @@ def home():
         'endpoints': {
             '/generate-smart-json': {
                 'method': 'POST',
-                'description': 'Generates a SmartJSON from multiple combined S3 files',
+                'description': 'Generates a SmartJSON from multiple combined S3 files and uploads it to S3',
                 'body': {
                     's3_paths': 'List of S3 paths (required) - e.g.: ["s3://bucket/file1.parquet", "s3://bucket/file2.csv"]'
+                },
+                'response': {
+                    'smartJsonS3Path': 'S3 path to the generated SmartJSON file',
+                    'processedFiles': 'Number of files successfully processed',
+                    'totalFiles': 'Total number of input files',
+                    'combinedRows': 'Total rows in the combined dataset',
+                    'combinedColumns': 'Total columns in the combined dataset'
                 },
                 'example': {
                     's3_paths': [
@@ -214,6 +252,8 @@ def home():
             'Combine multiple files into single dataset',
             'Generate comprehensive dataset statistics',
             'Support for mixed file formats',
+            'Upload SmartJSON results to S3',
+            'Return S3 path for frontend management',
             'Preserve original files on S3'
         ],
         'cors': {
