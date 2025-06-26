@@ -23,7 +23,14 @@ app = FastAPI(
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_origins=[
+        "http://localhost:3000", 
+        "http://localhost:3001",
+        "https://api-irys.trophe.net",
+        "https://irys.trophe.net",
+        "https://brickroadapp.com",
+        "https://staging-brickroadapp.vercel.app"
+    ],
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
@@ -210,7 +217,7 @@ def home():
             'Preserve original files on S3'
         ],
         'cors': {
-            'allowed_origins': ['http://localhost:3000', 'http://localhost:3001'],
+            'allowed_origins': ['http://localhost:3000', 'http://localhost:3001', ],
             'methods': ['GET', 'POST']
         }
     }
