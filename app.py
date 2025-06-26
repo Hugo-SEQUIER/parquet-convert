@@ -23,14 +23,7 @@ app = FastAPI(
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000", 
-        "http://localhost:3001",
-        "https://api-irys.trophe.net",
-        "https://irys.trophe.net",
-        "https://brickroadapp.com",
-        "https://staging-brickroadapp.vercel.app"
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
