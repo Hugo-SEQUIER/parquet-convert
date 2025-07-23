@@ -44,6 +44,7 @@ AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 AWS_REGION = os.getenv('AWS_REGION', 'eu-west-1')
 SMART_JSON_BUCKET = os.getenv('S3_BUCKET', 'irys-smart-json-output')  # Default bucket for smart JSON outputs
+PARQUET_BUCKET = os.getenv('PARQUET_BUCKET', 'irys-parquet')
 
 # S3 Client
 s3_client = boto3.client(
@@ -210,6 +211,82 @@ def generate_smart_json_endpoint(payload: S3PathsInput):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f'Internal error: {str(e)}')
 
+@app.post('/convert-to-parquet')
+def convert_to_parquet_endpoint(payload: S3PathsInput):
+    """
+    Endpoint to convert multiple S3 files to Parquet format and store them in S3.
+    
+    Expected JSON body:
+    {
+        "s3_paths": ["s3://bucket/path/to/file1.csv", "s3://bucket/path/to/file2.json"]
+    }
+    """
+    try:
+        s3_paths = payload.s3_paths
+        
+        converted_s3_paths = []
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for i, s3_path in enumerate(s3_paths):
+                try:
+                    print(f"🔄 [{i+1}/{len(s3_paths)}] Converting {s3_path} to Parquet...")
+                    
+                    source_bucket, source_key = parse_s3_path(s3_path)
+                    
+                    if not source_key:
+                        print(f"⚠️  Invalid path ignored: {s3_path}")
+                        continue
+                    
+                    original_filename = os.path.basename(source_key)
+                    local_input_path = os.path.join(temp_dir, f"input_{i}_{original_filename}")
+                    
+                    # 1. Download the file
+                    if not download_from_s3(source_bucket, source_key, local_input_path):
+                        print(f"❌ Download failed: {s3_path}")
+                        continue
+                    
+                    # 2. Read file into DataFrame
+                    try:
+                        df = read_file_to_dataframe(local_input_path)
+                    except Exception as e:
+                        print(f"❌ Error reading {s3_path}: {e}")
+                        continue
+                        
+                    # 3. Convert DataFrame to Parquet
+                    parquet_filename = f"{os.path.splitext(original_filename)[0]}.parquet"
+                    local_parquet_path = os.path.join(temp_dir, parquet_filename)
+                    df.to_parquet(local_parquet_path, index=False)
+                    print(f"✅ Converted {len(df)} rows to Parquet.")
+                    
+                    # 4. Upload Parquet to S3
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    unique_id = str(uuid.uuid4())[:8]
+                    parquet_key = f"converted-parquet/{timestamp}_{unique_id}_{parquet_filename}"
+                    
+                    s3_client.upload_file(local_parquet_path, PARQUET_BUCKET, parquet_key)
+                    
+                    converted_s3_path = f"s3://{PARQUET_BUCKET}/{parquet_key}"
+                    converted_s3_paths.append(converted_s3_path)
+                    print(f"✅ Parquet uploaded to: {converted_s3_path}")
+                    
+                except Exception as e:
+                    print(f"❌ Error processing {s3_path}: {e}")
+                    continue
+        
+        if not converted_s3_paths:
+            raise HTTPException(status_code=400, detail="No files could be converted successfully")
+            
+        return {
+            "convertedParquetS3Paths": converted_s3_paths,
+            "processedFiles": len(converted_s3_paths),
+            "totalFiles": len(s3_paths)
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f'Internal error: {str(e)}')
+
 @app.get('/health')
 def health_check():
     """Health check endpoint"""
@@ -239,6 +316,24 @@ def home():
                     's3_paths': [
                         's3://my-bucket/data/users_part1.parquet',
                         's3://my-bucket/data/users_part2.parquet'
+                    ]
+                }
+            },
+            '/convert-to-parquet': {
+                'method': 'POST',
+                'description': 'Converts multiple S3 files to Parquet format and uploads them to S3',
+                'body': {
+                    's3_paths': 'List of S3 paths (required) - e.g.: ["s3://bucket/file1.csv", "s3://bucket/file2.json"]'
+                },
+                'response': {
+                    'convertedParquetS3Paths': 'List of S3 paths to the generated Parquet files',
+                    'processedFiles': 'Number of files successfully processed',
+                    'totalFiles': 'Total number of input files'
+                },
+                'example': {
+                    's3_paths': [
+                        's3://my-bucket/data/sales.csv',
+                        's3://my-bucket/data/products.json'
                     ]
                 }
             },
