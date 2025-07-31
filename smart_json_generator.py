@@ -2,6 +2,12 @@ import pandas as pd
 import numpy as np
 import re
 from typing import List, Dict, Any, Union
+import multiprocessing as mp
+from functools import partial
+import os
+
+# Configuration pour le multiprocessing
+mp.set_start_method('spawn', force=True) if mp.get_start_method() != 'spawn' else None
 
 # --- MongoDB-like Format Helpers ---
 
@@ -336,32 +342,94 @@ def analyze_column(series: pd.Series, column_name: str) -> Dict[str, Any]:
             'sample': ["<analysis_failed>"]
         }
 
-def generate_smart_json(df: pd.DataFrame, raw_size_bytes: int, sample_size: int = 50) -> Dict[str, Any]:
-    """Main function to generate SmartJSON from a pandas DataFrame."""
-    print(f"🔍 Starting SmartJSON generation...")
-    n_rows, n_features = df.shape
-    print(f"📊 Dataset: {n_rows} rows, {n_features} columns")
+def analyze_column_batch(columns_batch, df_data, batch_id):
+    """Analyse un batch de colonnes en parallèle"""
+    print(f"    🚀 Worker {batch_id}: Processing {len(columns_batch)} columns...")
     
-    # Analyze columns one by one with progress
-    columns = []
-    print(f"🔄 Analyzing {n_features} columns...")
-    
-    for i, col in enumerate(df.columns):
+    # Reconstruit les données nécessaires (pas tout le DataFrame pour économiser la mémoire)
+    results = []
+    for col in columns_batch:
         try:
-            print(f"  📋 [{i+1}/{n_features}] Analyzing column: {col}")
-            column_profile = analyze_column(df[col], col)
-            columns.append(column_profile)
-            print(f"  ✅ [{i+1}/{n_features}] Done: {col} ({column_profile['type']})")
+            # Reconstruire la série à partir des données sérialisées
+            series = pd.Series(df_data[col], name=col)
+            result = analyze_column(series, col)
+            results.append(result)
         except Exception as e:
-            print(f"  ❌ [{i+1}/{n_features}] Failed: {col} - {e}")
-            # Create a minimal profile for failed columns
-            columns.append({
+            print(f"    ❌ Worker {batch_id}: Failed analyzing {col}: {e}")
+            results.append({
                 'name': col,
                 'type': 'unknown',
                 'missing': format_number(0),
                 'unique': format_number(0),
                 'sample': ["<analysis_failed>"]
             })
+    
+    print(f"    ✅ Worker {batch_id}: Completed {len(results)} columns")
+    return results
+
+def generate_smart_json(df: pd.DataFrame, raw_size_bytes: int, sample_size: int = 50) -> Dict[str, Any]:
+    """Main function to generate SmartJSON from a pandas DataFrame."""
+    print(f"🔍 Starting SmartJSON generation...")
+    n_rows, n_features = df.shape
+    print(f"📊 Dataset: {n_rows} rows, {n_features} columns")
+    
+    # Décider si utiliser le traitement parallèle
+    use_parallel = n_features > 10  # Parallélise seulement si plus de 10 colonnes
+    
+    if use_parallel:
+        print(f"🚀 Using parallel processing for {n_features} columns...")
+        
+        # Détermine le nombre de workers optimaux
+        n_cores = min(mp.cpu_count(), max(2, n_features // 5))  # Au moins 2, max cpu_count
+        print(f"🔧 Using {n_cores} workers for column analysis")
+        
+        # Divise les colonnes en batches
+        batch_size = max(1, n_features // n_cores)
+        column_batches = []
+        for i in range(0, n_features, batch_size):
+            batch = df.columns[i:i+batch_size].tolist()
+            column_batches.append(batch)
+        
+        print(f"📦 Created {len(column_batches)} batches (avg {batch_size} columns per batch)")
+        
+        # Convertit le DataFrame en dict pour le multiprocessing (plus efficace)
+        print(f"🔄 Preparing data for parallel processing...")
+        df_data = {col: df[col].values.tolist() for col in df.columns}
+        
+        # Traitement parallèle
+        try:
+            with mp.Pool(n_cores) as pool:
+                batch_args = [(batch, df_data, i+1) for i, batch in enumerate(column_batches)]
+                batch_results = pool.starmap(analyze_column_batch, batch_args)
+            
+            # Flatten results
+            columns = [col for batch in batch_results for col in batch]
+            print(f"✅ Parallel processing completed: {len(columns)} columns analyzed")
+            
+        except Exception as e:
+            print(f"⚠️  Parallel processing failed: {e}, falling back to sequential...")
+            use_parallel = False
+    
+    if not use_parallel:
+        print(f"🔄 Using sequential processing for {n_features} columns...")
+        columns = []
+        
+        for i, col in enumerate(df.columns):
+            try:
+                print(f"  📋 [{i+1}/{n_features}] Analyzing column: {col}")
+                column_profile = analyze_column(df[col], col)
+                columns.append(column_profile)
+                print(f"  ✅ [{i+1}/{n_features}] Done: {col} ({column_profile['type']})")
+            except Exception as e:
+                print(f"  ❌ [{i+1}/{n_features}] Failed: {col} - {e}")
+                # Create a minimal profile for failed columns
+                columns.append({
+                    'name': col,
+                    'type': 'unknown',
+                    'missing': format_number(0),
+                    'unique': format_number(0),
+                    'sample': ["<analysis_failed>"]
+                })
     
     # Calculate total missing values - convert from MongoDB format to int
     print(f"🔄 Calculating missing values...")

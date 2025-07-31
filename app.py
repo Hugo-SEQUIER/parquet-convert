@@ -4,6 +4,7 @@ from pydantic import BaseModel, conlist
 from typing import List
 import boto3
 import pandas as pd
+import numpy as np
 import os
 import tempfile
 import json
@@ -11,6 +12,15 @@ import uuid
 from datetime import datetime
 from dotenv import load_dotenv
 import uvicorn
+import concurrent.futures
+import threading
+
+# Optimisations pandas pour les gros datasets
+pd.set_option('compute.use_bottleneck', True)
+pd.set_option('compute.use_numexpr', True)
+
+# Optimise PyArrow pour les fichiers Parquet
+os.environ['ARROW_IO_THREADS'] = '4'  # Threads I/O pour PyArrow
 
 # Import the new smart json generator
 from smart_json_generator import generate_smart_json
@@ -94,15 +104,129 @@ def read_file_to_dataframe(input_path: str) -> pd.DataFrame:
     file_extension = os.path.splitext(input_path)[1].lower()
     
     if file_extension == '.parquet':
-        return pd.read_parquet(input_path)
+        return pd.read_parquet(input_path, engine='pyarrow')
     elif file_extension == '.csv':
-        return pd.read_csv(input_path)
+        # Pour les gros fichiers CSV, lecture optimisée
+        file_size = os.path.getsize(input_path)
+        if file_size > 500 * 1024 * 1024:  # Plus de 500MB
+            print(f"    📊 Large CSV detected ({file_size / (1024*1024):.1f}MB), using chunked reading...")
+            chunks = []
+            chunksize = 50000  # Ajustez selon la RAM disponible
+            for chunk in pd.read_csv(input_path, chunksize=chunksize, low_memory=False):
+                chunks.append(chunk)
+            return pd.concat(chunks, ignore_index=True, copy=False)
+        else:
+            return pd.read_csv(input_path, low_memory=False)
     elif file_extension == '.json':
         return pd.read_json(input_path)
     elif file_extension in ['.xlsx', '.xls']:
         return pd.read_excel(input_path)
     else:
         raise ValueError(f"Unsupported file format: {file_extension}")
+
+def download_files_parallel(s3_paths, temp_dir, max_workers=4):
+    """Télécharge les fichiers S3 en parallèle pour accélérer le processus"""
+    def download_single(args):
+        i, s3_path = args
+        try:
+            print(f"📥 [{i+1}/{len(s3_paths)}] Starting download {s3_path}")
+            
+            source_bucket, source_key = parse_s3_path(s3_path)
+            if not source_key:
+                print(f"⚠️  Invalid path ignored: {s3_path}")
+                return None
+            
+            original_filename = os.path.basename(source_key)
+            local_path = os.path.join(temp_dir, f"{i}_{original_filename}")
+            
+            # Download the file
+            if download_from_s3(source_bucket, source_key, local_path):
+                file_size = os.path.getsize(local_path)
+                print(f"✅ [{i+1}/{len(s3_paths)}] Downloaded {s3_path} ({file_size} bytes)")
+                return (i, s3_path, local_path, source_bucket, source_key, file_size)
+            else:
+                print(f"❌ Download failed: {s3_path}")
+                return None
+        except Exception as e:
+            print(f"❌ Error downloading {s3_path}: {e}")
+            return None
+    
+    print(f"🚀 Starting parallel download of {len(s3_paths)} files with {max_workers} workers...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = list(executor.map(download_single, enumerate(s3_paths)))
+    
+    successful_downloads = [r for r in results if r is not None]
+    print(f"✅ Parallel download completed: {len(successful_downloads)}/{len(s3_paths)} files successful")
+    return successful_downloads
+
+def optimize_dataframe_memory(df):
+    """Optimise l'utilisation mémoire d'un DataFrame"""
+    print(f"🔧 Optimizing DataFrame memory usage...")
+    
+    initial_memory = df.memory_usage(deep=True).sum() / 1024**2  # MB
+    print(f"    📊 Initial memory usage: {initial_memory:.1f} MB")
+    
+    # Optimise les types de données
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            # Essaie de convertir en catégorie si peu de valeurs uniques
+            unique_ratio = df[col].nunique() / len(df)
+            if unique_ratio < 0.5:  # Moins de 50% de valeurs uniques
+                try:
+                    df[col] = df[col].astype('category')
+                except:
+                    pass
+        elif df[col].dtype == 'int64':
+            # Optimise les entiers
+            if df[col].min() >= 0:
+                if df[col].max() < 255:
+                    df[col] = df[col].astype('uint8')
+                elif df[col].max() < 65535:
+                    df[col] = df[col].astype('uint16')
+                elif df[col].max() < 4294967295:
+                    df[col] = df[col].astype('uint32')
+            else:
+                if df[col].min() >= -128 and df[col].max() < 127:
+                    df[col] = df[col].astype('int8')
+                elif df[col].min() >= -32768 and df[col].max() < 32767:
+                    df[col] = df[col].astype('int16')
+                elif df[col].min() >= -2147483648 and df[col].max() < 2147483647:
+                    df[col] = df[col].astype('int32')
+        elif df[col].dtype == 'float64':
+            # Essaie de convertir en float32 si possible
+            try:
+                if df[col].min() >= np.finfo(np.float32).min and df[col].max() <= np.finfo(np.float32).max:
+                    df[col] = df[col].astype('float32')
+            except:
+                pass
+    
+    final_memory = df.memory_usage(deep=True).sum() / 1024**2  # MB
+    reduction = (initial_memory - final_memory) / initial_memory * 100
+    print(f"    ✅ Memory optimized: {final_memory:.1f} MB ({reduction:.1f}% reduction)")
+    
+    return df
+
+def combine_dataframes_optimized(dataframes):
+    """Combine les DataFrames de manière optimisée selon leurs caractéristiques"""
+    if len(dataframes) == 1:
+        return optimize_dataframe_memory(dataframes[0])
+    
+    print(f"🔄 Optimizing combination of {len(dataframes)} DataFrames...")
+    
+    # Vérifie si toutes les colonnes sont identiques
+    first_cols = set(dataframes[0].columns)
+    all_same_cols = all(set(df.columns) == first_cols for df in dataframes[1:])
+    
+    if all_same_cols:
+        print("✅ All DataFrames have identical columns - using fast concat")
+        combined = pd.concat(dataframes, ignore_index=True, copy=False)
+    else:
+        print("🔄 DataFrames have different columns - aligning before concat")
+        # Utilise sort=False pour maintenir l'ordre des colonnes du premier DataFrame
+        combined = pd.concat(dataframes, ignore_index=True, sort=False, copy=False)
+    
+    # Optimise la mémoire du DataFrame final
+    return optimize_dataframe_memory(combined)
 
 class S3PathsInput(BaseModel):
     s3_paths: conlist(str, min_length=1)
@@ -125,56 +249,38 @@ def generate_smart_json_endpoint(payload: S3PathsInput):
         processed_files = []
         
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Process each file
-            for i, s3_path in enumerate(s3_paths):
+            # 1. Download all files in parallel
+            successful_downloads = download_files_parallel(s3_paths, temp_dir, max_workers=4)
+            
+            if not successful_downloads:
+                raise HTTPException(status_code=400, detail="No files could be downloaded successfully")
+            
+            # 2. Process downloaded files into DataFrames
+            print(f"🔄 Reading {len(successful_downloads)} downloaded files into DataFrames...")
+            for i, s3_path, local_path, source_bucket, source_key, file_size in successful_downloads:
                 try:
-                    print(f"📥 [{i+1}/{len(s3_paths)}] Processing {s3_path}")
+                    print(f"📖 [{len(combined_dataframes)+1}/{len(successful_downloads)}] Reading {os.path.basename(local_path)}...")
                     
-                    source_bucket, source_key = parse_s3_path(s3_path)
-                    
-                    if not source_key:
-                        print(f"⚠️  Invalid path ignored: {s3_path}")
-                        continue
-                    
-                    original_filename = os.path.basename(source_key)
-                    local_path = os.path.join(temp_dir, f"{i}_{original_filename}")
-                    
-                    # 1. Download the file
-                    if not download_from_s3(source_bucket, source_key, local_path):
-                        print(f"❌ Download failed: {s3_path}")
-                        continue
-                    
-                    file_size = os.path.getsize(local_path)
                     total_raw_size += file_size
-                    print(f"📊 Size: {file_size} bytes")
-
-                    # 2. Read file into DataFrame
-                    try:
-                        df = read_file_to_dataframe(local_path)
-                        combined_dataframes.append(df)
-                        processed_files.append((source_bucket, source_key, s3_path))
-                        print(f"✅ Added: {len(df)} rows, {len(df.columns)} columns")
-                    except Exception as e:
-                        print(f"❌ Error reading {s3_path}: {e}")
-                        continue
-                        
+                    
+                    # Read file into DataFrame with optimizations
+                    df = read_file_to_dataframe(local_path)
+                    combined_dataframes.append(df)
+                    processed_files.append((source_bucket, source_key, s3_path))
+                    print(f"✅ Added: {len(df)} rows, {len(df.columns)} columns")
+                    
                 except Exception as e:
-                    print(f"❌ Error processing {s3_path}: {e}")
+                    print(f"❌ Error reading {local_path}: {e}")
                     continue
             
             # Check that at least one file has been processed
             if not combined_dataframes:
                 raise HTTPException(status_code=400, detail="No files could be processed successfully")
             
-            # 3. Combine all DataFrames
+            # 3. Combine all DataFrames using optimized method
             print(f"🔄 Combining {len(combined_dataframes)} files...")
             try:
-                if len(combined_dataframes) == 1:
-                    combined_df = combined_dataframes[0]
-                else:
-                    # Combine with concat, handling different columns
-                    combined_df = pd.concat(combined_dataframes, ignore_index=True, sort=False)
-                
+                combined_df = combine_dataframes_optimized(combined_dataframes)
                 print(f"✅ Combined dataset: {len(combined_df)} rows, {len(combined_df.columns)} columns")
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error during combination: {e}")
@@ -359,4 +465,13 @@ def home():
     return documentation
 
 if __name__ == '__main__':
-    uvicorn.run(app, host='0.0.0.0', port=5000, workers=4) 
+    uvicorn.run(
+        app, 
+        host='0.0.0.0', 
+        port=5000, 
+        workers=1,  # Single worker pour éviter concurrence mémoire sur gros datasets
+        loop="uvloop",  # Boucle d'événements plus rapide
+        http="httptools",  # Parser HTTP plus rapide
+        access_log=False,  # Désactive les logs d'accès pour de meilleures performances
+        timeout_keep_alive=300  # Timeout plus long pour les gros traitements
+    ) 
