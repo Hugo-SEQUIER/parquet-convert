@@ -5,9 +5,16 @@ from typing import List, Dict, Any, Union
 import multiprocessing as mp
 from functools import partial
 import os
+import concurrent.futures
+import threading
 
-# Configuration pour le multiprocessing
-mp.set_start_method('spawn', force=True) if mp.get_start_method() != 'spawn' else None
+# Configuration pour le multiprocessing avec gestion d'erreurs
+try:
+    if mp.get_start_method() != 'spawn':
+        mp.set_start_method('spawn', force=True)
+except (RuntimeError, OSError):
+    print("⚠️  Could not set multiprocessing start method, using default")
+    pass
 
 # --- MongoDB-like Format Helpers ---
 
@@ -343,7 +350,7 @@ def analyze_column(series: pd.Series, column_name: str) -> Dict[str, Any]:
         }
 
 def analyze_column_batch(columns_batch, df_data, batch_id):
-    """Analyse un batch de colonnes en parallèle"""
+    """Analyse un batch de colonnes en parallèle (multiprocessing)"""
     print(f"    🚀 Worker {batch_id}: Processing {len(columns_batch)} columns...")
     
     # Reconstruit les données nécessaires (pas tout le DataFrame pour économiser la mémoire)
@@ -367,24 +374,66 @@ def analyze_column_batch(columns_batch, df_data, batch_id):
     print(f"    ✅ Worker {batch_id}: Completed {len(results)} columns")
     return results
 
+def analyze_column_batch_threaded(columns_batch, df, batch_id):
+    """Analyse un batch de colonnes avec threading (plus sûr pour la mémoire)"""
+    print(f"    🧵 Thread {batch_id}: Processing {len(columns_batch)} columns...")
+    
+    results = []
+    for col in columns_batch:
+        try:
+            result = analyze_column(df[col], col)
+            results.append(result)
+        except Exception as e:
+            print(f"    ❌ Thread {batch_id}: Failed analyzing {col}: {e}")
+            results.append({
+                'name': col,
+                'type': 'unknown',
+                'missing': format_number(0),
+                'unique': format_number(0),
+                'sample': ["<analysis_failed>"]
+            })
+    
+    print(f"    ✅ Thread {batch_id}: Completed {len(results)} columns")
+    return results
+
 def generate_smart_json(df: pd.DataFrame, raw_size_bytes: int, sample_size: int = 50) -> Dict[str, Any]:
     """Main function to generate SmartJSON from a pandas DataFrame."""
     print(f"🔍 Starting SmartJSON generation...")
     n_rows, n_features = df.shape
     print(f"📊 Dataset: {n_rows} rows, {n_features} columns")
     
-    # Décider si utiliser le traitement parallèle
-    use_parallel = n_features > 10  # Parallélise seulement si plus de 10 colonnes
+    # Calcule la taille estimée en mémoire du DataFrame
+    df_memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
+    print(f"📊 DataFrame memory usage: {df_memory_mb:.1f} MB")
     
-    if use_parallel:
-        print(f"🚀 Using parallel processing for {n_features} columns...")
+    # Vérifier si le multiprocessing est désactivé via variable d'environnement
+    mp_disabled = os.getenv('DISABLE_MULTIPROCESSING', 'false').lower() == 'true'
+    if mp_disabled:
+        print("⚠️  Multiprocessing disabled via DISABLE_MULTIPROCESSING env var")
+    
+    # Stratégie de parallélisation intelligente
+    use_multiprocessing = (not mp_disabled and 
+                          n_features >= 15 and 
+                          n_features <= 30 and 
+                          df_memory_mb < 200)  # Très restrictif pour multiprocessing
+    
+    use_threading = (n_features >= 10 and 
+                    n_features <= 100 and 
+                    df_memory_mb < 1000)  # Plus permissif pour threading
+    
+    parallel_method = None
+    
+    if use_multiprocessing:
+        parallel_method = "multiprocessing"
+        print(f"🚀 Using multiprocessing for {n_features} columns (memory: {df_memory_mb:.1f}MB)")
         
-        # Détermine le nombre de workers optimaux
-        n_cores = min(mp.cpu_count(), max(2, n_features // 5))  # Au moins 2, max cpu_count
-        print(f"🔧 Using {n_cores} workers for column analysis")
+        # Configuration conservatrice pour multiprocessing
+        max_workers = min(3, max(2, n_features // 10))
+        n_cores = min(mp.cpu_count(), max_workers)
+        print(f"🔧 Using {n_cores} processes for column analysis")
         
-        # Divise les colonnes en batches
-        batch_size = max(1, n_features // n_cores)
+        # Batches plus grands pour réduire l'overhead
+        batch_size = max(5, n_features // n_cores)
         column_batches = []
         for i in range(0, n_features, batch_size):
             batch = df.columns[i:i+batch_size].tolist()
@@ -392,25 +441,69 @@ def generate_smart_json(df: pd.DataFrame, raw_size_bytes: int, sample_size: int 
         
         print(f"📦 Created {len(column_batches)} batches (avg {batch_size} columns per batch)")
         
-        # Convertit le DataFrame en dict pour le multiprocessing (plus efficace)
-        print(f"🔄 Preparing data for parallel processing...")
-        df_data = {col: df[col].values.tolist() for col in df.columns}
+        # Sample data pour multiprocessing
+        print(f"🔄 Sampling data for multiprocessing...")
+        sample_size_rows = min(30000, max(5000, int(len(df) * 0.15)))
+        df_sample = df.sample(n=sample_size_rows, random_state=42)
+        df_data = {col: df_sample[col].values.tolist() for col in df.columns}
+        print(f"📊 Using sample of {sample_size_rows} rows for analysis")
         
-        # Traitement parallèle
+        # Tentative multiprocessing
         try:
             with mp.Pool(n_cores) as pool:
                 batch_args = [(batch, df_data, i+1) for i, batch in enumerate(column_batches)]
                 batch_results = pool.starmap(analyze_column_batch, batch_args)
+                pool.close()
+                pool.join()
             
-            # Flatten results
             columns = [col for batch in batch_results for col in batch]
-            print(f"✅ Parallel processing completed: {len(columns)} columns analyzed")
+            print(f"✅ Multiprocessing completed: {len(columns)} columns analyzed")
             
         except Exception as e:
-            print(f"⚠️  Parallel processing failed: {e}, falling back to sequential...")
-            use_parallel = False
+            print(f"⚠️  Multiprocessing failed: {e}, trying threading...")
+            parallel_method = "threading"
+            
+    elif use_threading:
+        parallel_method = "threading"
+        
+    if parallel_method == "threading":
+        print(f"🧵 Using threading for {n_features} columns (memory: {df_memory_mb:.1f}MB)")
+        
+        # Configuration pour threading
+        max_workers = min(4, max(2, n_features // 5))
+        print(f"🔧 Using {max_workers} threads for column analysis")
+        
+        batch_size = max(3, n_features // max_workers)
+        column_batches = []
+        for i in range(0, n_features, batch_size):
+            batch = df.columns[i:i+batch_size].tolist()
+            column_batches.append(batch)
+        
+        print(f"📦 Created {len(column_batches)} batches (avg {batch_size} columns per batch)")
+        
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_batch = {
+                    executor.submit(analyze_column_batch_threaded, batch, df, i+1): i
+                    for i, batch in enumerate(column_batches)
+                }
+                
+                batch_results = []
+                for future in concurrent.futures.as_completed(future_to_batch):
+                    try:
+                        result = future.result()
+                        batch_results.append(result)
+                    except Exception as e:
+                        print(f"❌ Thread batch failed: {e}")
+                        
+            columns = [col for batch in batch_results for col in batch]
+            print(f"✅ Threading completed: {len(columns)} columns analyzed")
+            
+        except Exception as e:
+            print(f"⚠️  Threading failed: {e}, falling back to sequential...")
+            parallel_method = None
     
-    if not use_parallel:
+    if parallel_method is None:
         print(f"🔄 Using sequential processing for {n_features} columns...")
         columns = []
         
