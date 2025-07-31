@@ -160,49 +160,95 @@ def download_files_parallel(s3_paths, temp_dir, max_workers=4):
     return successful_downloads
 
 def optimize_dataframe_memory(df):
-    """Optimise l'utilisation mémoire d'un DataFrame"""
+    """Optimise l'utilisation mémoire d'un DataFrame de façon sécurisée"""
     print(f"🔧 Optimizing DataFrame memory usage...")
     
     initial_memory = df.memory_usage(deep=True).sum() / 1024**2  # MB
     print(f"    📊 Initial memory usage: {initial_memory:.1f} MB")
     
+    optimized_count = 0
+    
     # Optimise les types de données
     for col in df.columns:
-        if df[col].dtype == 'object':
-            # Essaie de convertir en catégorie si peu de valeurs uniques
-            unique_ratio = df[col].nunique() / len(df)
-            if unique_ratio < 0.5:  # Moins de 50% de valeurs uniques
+        try:
+            if df[col].dtype == 'object':
+                # Vérifie d'abord si la colonne contient des objets complexes
+                sample = df[col].dropna().head(100)
+                if len(sample) == 0:
+                    continue
+                
+                # Test si les données sont des types simples (strings, numbers)
+                has_complex_objects = False
+                for val in sample:
+                    if isinstance(val, (dict, list, tuple, set)):
+                        has_complex_objects = True
+                        break
+                
+                if not has_complex_objects:
+                    # Essaie de convertir en catégorie si peu de valeurs uniques
+                    try:
+                        unique_ratio = df[col].nunique() / len(df)
+                        if unique_ratio < 0.5:  # Moins de 50% de valeurs uniques
+                            df[col] = df[col].astype('category')
+                            optimized_count += 1
+                            print(f"    ✅ {col}: converted to category")
+                    except (TypeError, ValueError):
+                        # Si nunique() échoue, on essaie de convertir en string
+                        try:
+                            df[col] = df[col].astype(str).astype('category')
+                            optimized_count += 1
+                            print(f"    ✅ {col}: converted complex objects to categorical strings")
+                        except:
+                            print(f"    ⚠️  {col}: skipped (complex objects)")
+                else:
+                    print(f"    ⚠️  {col}: skipped (contains complex objects like dict/list)")
+                    
+            elif df[col].dtype == 'int64':
+                # Optimise les entiers
                 try:
-                    df[col] = df[col].astype('category')
+                    col_min, col_max = df[col].min(), df[col].max()
+                    if col_min >= 0:
+                        if col_max < 255:
+                            df[col] = df[col].astype('uint8')
+                            optimized_count += 1
+                        elif col_max < 65535:
+                            df[col] = df[col].astype('uint16')
+                            optimized_count += 1
+                        elif col_max < 4294967295:
+                            df[col] = df[col].astype('uint32')
+                            optimized_count += 1
+                    else:
+                        if col_min >= -128 and col_max < 127:
+                            df[col] = df[col].astype('int8')
+                            optimized_count += 1
+                        elif col_min >= -32768 and col_max < 32767:
+                            df[col] = df[col].astype('int16')
+                            optimized_count += 1
+                        elif col_min >= -2147483648 and col_max < 2147483647:
+                            df[col] = df[col].astype('int32')
+                            optimized_count += 1
                 except:
-                    pass
-        elif df[col].dtype == 'int64':
-            # Optimise les entiers
-            if df[col].min() >= 0:
-                if df[col].max() < 255:
-                    df[col] = df[col].astype('uint8')
-                elif df[col].max() < 65535:
-                    df[col] = df[col].astype('uint16')
-                elif df[col].max() < 4294967295:
-                    df[col] = df[col].astype('uint32')
-            else:
-                if df[col].min() >= -128 and df[col].max() < 127:
-                    df[col] = df[col].astype('int8')
-                elif df[col].min() >= -32768 and df[col].max() < 32767:
-                    df[col] = df[col].astype('int16')
-                elif df[col].min() >= -2147483648 and df[col].max() < 2147483647:
-                    df[col] = df[col].astype('int32')
-        elif df[col].dtype == 'float64':
-            # Essaie de convertir en float32 si possible
-            try:
-                if df[col].min() >= np.finfo(np.float32).min and df[col].max() <= np.finfo(np.float32).max:
-                    df[col] = df[col].astype('float32')
-            except:
-                pass
+                    print(f"    ⚠️  {col}: int optimization failed")
+                    
+            elif df[col].dtype == 'float64':
+                # Essaie de convertir en float32 si possible
+                try:
+                    col_min, col_max = df[col].min(), df[col].max()
+                    if (pd.notna(col_min) and pd.notna(col_max) and 
+                        col_min >= np.finfo(np.float32).min and col_max <= np.finfo(np.float32).max):
+                        df[col] = df[col].astype('float32')
+                        optimized_count += 1
+                except:
+                    print(f"    ⚠️  {col}: float optimization failed")
+                    
+        except Exception as e:
+            print(f"    ❌ {col}: optimization failed - {str(e)[:50]}...")
+            continue
     
     final_memory = df.memory_usage(deep=True).sum() / 1024**2  # MB
     reduction = (initial_memory - final_memory) / initial_memory * 100
     print(f"    ✅ Memory optimized: {final_memory:.1f} MB ({reduction:.1f}% reduction)")
+    print(f"    📊 Optimized {optimized_count}/{len(df.columns)} columns")
     
     return df
 
