@@ -468,7 +468,7 @@ if __name__ == '__main__':
     uvicorn.run(
         app, 
         host='0.0.0.0', 
-        port=5000, 
+        port=8000, 
         workers=1,  # Single worker pour éviter concurrence mémoire sur gros datasets
         loop="uvloop",  # Boucle d'événements plus rapide
         http="httptools",  # Parser HTTP plus rapide
