@@ -48,7 +48,9 @@ def detect_column_type(series: pd.Series) -> str:
         if series.empty:
             return "string"
         
-        sample = series.head(100)
+        # Utilise un échantillon plus grand pour de meilleurs résultats, mais pas trop pour la vitesse
+        sample_size = min(1000, len(series))
+        sample = series.head(sample_size)
 
         # 1. Datetime
         date_patterns = [
@@ -130,22 +132,53 @@ def generate_numeric_stats(series: pd.Series) -> Dict[str, Any]:
 
 # --- Category Stats ---
 
+def is_image_or_binary_column(series: pd.Series, column_name: str) -> bool:
+    """Détecte rapidement si une colonne contient des images ou données binaires."""
+    # Vérifie d'abord par le nom de la colonne
+    image_keywords = ['image', 'img', 'photo', 'picture', 'pic', 'avatar', 'thumbnail', 'binary', 'blob', 'base64']
+    if any(keyword in column_name.lower() for keyword in image_keywords):
+        return True
+    
+    # Sample rapide pour détecter le contenu
+    sample = series.dropna().head(10)  # Seulement 10 échantillons
+    if len(sample) == 0:
+        return False
+    
+    try:
+        sample_str = sample.astype(str)
+        
+        # Vérifie si c'est du base64 (images encodées)
+        base64_pattern = r'^[A-Za-z0-9+/=]+$'
+        base64_count = sample_str.str.match(base64_pattern).sum()
+        if base64_count > len(sample) * 0.7:  # 70% match base64
+            return True
+        
+        # Vérifie la longueur moyenne sur l'échantillon
+        avg_length = sample_str.str.len().mean()
+        if avg_length > 2000:  # Plus de 2000 caractères en moyenne
+            return True
+            
+        # Vérifie si ça contient des indicateurs binaires
+        for val in sample_str:
+            if len(val) > 1000 and ('data:image' in val or val.startswith('iVBOR') or val.startswith('/9j/')):
+                return True
+                
+    except Exception:
+        pass
+    
+    return False
+
 def generate_category_stats(series: pd.Series, column_name: str) -> Dict[str, Any]:
     """Generates statistics for a categorical column."""
     series = series.dropna().astype(str)
     
-    # Check if this might be a large data column (images, binary data, etc.)
-    if len(series) > 0:
-        avg_length = series.str.len().mean()
-        max_length = series.str.len().max()
-        
-        # If average length > 1000 chars or max > 10000, likely binary/image data
-        if avg_length > 1000 or max_length > 10000:
-            print(f"    ⚠️  Large data detected in {column_name} (avg: {avg_length:.0f}, max: {max_length:.0f} chars)")
-            return {
-                'top': [{'value': f'<large_data_avg_{avg_length:.0f}_chars>', 'count': format_number(len(series))}],
-                'other': format_number(0)
-            }
+    # Détection rapide et précoce des colonnes avec images/binaire
+    if is_image_or_binary_column(series, column_name):
+        print(f"    🖼️  Image/binary column detected: {column_name} - skipping detailed analysis")
+        return {
+            'top': [{'value': '<image_or_binary_data>', 'count': format_number(len(series))}],
+            'other': format_number(0)
+        }
     
     try:
         counts = series.value_counts()
@@ -177,28 +210,35 @@ def generate_category_stats(series: pd.Series, column_name: str) -> Dict[str, An
 
 def generate_smart_categories(series: pd.Series, column_name: str) -> Union[Dict, None]:
     """Attempt to generate 'smart' categories for dates, IDs, or emails."""
-    # Skip smart categorization for large data
+    # Skip si c'est une colonne d'images détectée
+    if is_image_or_binary_column(series, column_name):
+        return None
+        
+    # Skip smart categorization for large data (garde cette protection pour éviter les calculs trop longs)
     if len(series) > 0:
-        avg_length = series.str.len().mean()
+        # Test avec un échantillon plus petit pour la vitesse
+        sample_for_length = series.head(50)
+        avg_length = sample_for_length.str.len().mean()
         if avg_length > 500:  # Skip smart categories for large data
             return None
     
     try:
-        sample = series.head(100)
+        # Utilise un échantillon plus grand pour de meilleurs résultats
+        sample = series.head(500) if len(series) > 500 else series
 
         # Date-like
         if is_date_like_column(sample):
-            result = generate_date_categories(series)
+            result = generate_date_categories(series)  # Utilise toute la série
             if result:
                 return result
         # ID-like
         if is_id_like_column(sample, column_name):
-            result = generate_id_categories(series)
+            result = generate_id_categories(series)  # Utilise toute la série
             if result:
                 return result
         # Email-like
         if is_email_like_column(sample):
-            result = generate_email_categories(series)
+            result = generate_email_categories(series)  # Utilise toute la série
             if result:
                 return result
             
@@ -290,6 +330,21 @@ def generate_correlations(df: pd.DataFrame) -> Union[Dict, None]:
 def analyze_column(series: pd.Series, column_name: str) -> Dict[str, Any]:
     """Analyzes a single column and returns its profile."""
     try:
+        # Détection précoce des colonnes d'images pour éviter le traitement coûteux
+        if is_image_or_binary_column(series, column_name):
+            print(f"    🖼️  Image/binary column detected: {column_name} - using fast analysis")
+            return {
+                'name': column_name,
+                'type': 'string',
+                'missing': format_number(series.isnull().sum()),
+                'unique': format_number(1),  # Assume unique pour éviter le calcul coûteux
+                'sample': ['<image_or_binary_data>'],
+                'categories': {
+                    'top': [{'value': '<image_or_binary_data>', 'count': format_number(len(series))}],
+                    'other': format_number(0)
+                }
+            }
+        
         print(f"    🔍 Analyzing missing values for {column_name}...")
         missing = series.isnull().sum()
         non_null_series = series.dropna()
@@ -411,11 +466,11 @@ def generate_smart_json(df: pd.DataFrame, raw_size_bytes: int, sample_size: int 
     if mp_disabled:
         print("⚠️  Multiprocessing disabled via DISABLE_MULTIPROCESSING env var")
     
-    # Stratégie de parallélisation intelligente
+    # Stratégie de parallélisation intelligente (plus restrictive maintenant qu'on n'a plus de sampling)
     use_multiprocessing = (not mp_disabled and 
-                          n_features >= 15 and 
-                          n_features <= 30 and 
-                          df_memory_mb < 200)  # Très restrictif pour multiprocessing
+                          n_features >= 20 and 
+                          n_features <= 25 and 
+                          df_memory_mb < 100)  # Encore plus restrictif sans sampling
     
     use_threading = (n_features >= 10 and 
                     n_features <= 100 and 
@@ -441,12 +496,10 @@ def generate_smart_json(df: pd.DataFrame, raw_size_bytes: int, sample_size: int 
         
         print(f"📦 Created {len(column_batches)} batches (avg {batch_size} columns per batch)")
         
-        # Sample data pour multiprocessing
-        print(f"🔄 Sampling data for multiprocessing...")
-        sample_size_rows = min(30000, max(5000, int(len(df) * 0.15)))
-        df_sample = df.sample(n=sample_size_rows, random_state=42)
-        df_data = {col: df_sample[col].values.tolist() for col in df.columns}
-        print(f"📊 Using sample of {sample_size_rows} rows for analysis")
+        # Utilise tout le dataset pour multiprocessing (plus de sampling)
+        print(f"🔄 Preparing full dataset for multiprocessing...")
+        df_data = {col: df[col].values.tolist() for col in df.columns}
+        print(f"📊 Using full dataset ({len(df)} rows) for analysis")
         
         # Tentative multiprocessing
         try:
